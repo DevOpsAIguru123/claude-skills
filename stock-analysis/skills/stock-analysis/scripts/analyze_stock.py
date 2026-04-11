@@ -141,9 +141,11 @@ def _av_fetch(url):
 
 
 def get_technicals(symbol, av_key):
-    """Fetch RSI-14, MACD, SMA-50 from Alpha Vantage."""
+    """Fetch RSI-14, MACD, SMA-50 from Alpha Vantage (free tier: 5 req/min)."""
+    import time
 
     def _av(function, extra):
+        time.sleep(13)  # stay within 5 req/min on free tier
         return _av_fetch(f"{_AV_BASE}?function={function}&symbol={symbol}&apikey={av_key}&{extra}")
 
     result = {}
@@ -155,25 +157,12 @@ def get_technicals(symbol, av_key):
         latest = sorted(series.keys())[-1]
         result["rsi"] = float(series[latest]["RSI"])
 
-    # MACD
-    macd_data = _av("MACD", "interval=daily&series_type=close")
-    if macd_data and "Technical Analysis: MACD" in macd_data:
-        series = macd_data["Technical Analysis: MACD"]
-        dates = sorted(series.keys())
-        if len(dates) >= 2:
-            cur = series[dates[-1]]
-            prv = series[dates[-2]]
-            macd_cur, sig_cur = float(cur["MACD"]), float(cur["MACD_Signal"])
-            macd_prv, sig_prv = float(prv["MACD"]), float(prv["MACD_Signal"])
-            result["macd"] = macd_cur
-            result["macd_signal_line"] = sig_cur
-            if macd_prv < sig_prv and macd_cur >= sig_cur:
-                result["macd_cross"] = "bullish"
-            elif macd_prv > sig_prv and macd_cur <= sig_cur:
-                result["macd_cross"] = "bearish"
-            else:
-                result["macd_cross"] = "none"
-                result["macd_above"] = macd_cur > sig_cur
+    # EMA-20 (MACD is premium; EMA-20 vs price is an equivalent free momentum signal)
+    ema_data = _av("EMA", "interval=daily&time_period=20&series_type=close")
+    if ema_data and "Technical Analysis: EMA" in ema_data:
+        series = ema_data["Technical Analysis: EMA"]
+        latest = sorted(series.keys())[-1]
+        result["ema_20"] = float(series[latest]["EMA"])
 
     # SMA-50
     sma_data = _av("SMA", "interval=daily&time_period=50&series_type=close")
@@ -226,16 +215,13 @@ def score(data, technicals):
             else:
                 votes.append((0, f"RSI-14 {rsi:.1f} — neutral (30–70)"))
 
-        # MACD crossover
-        cross = technicals.get("macd_cross")
-        if cross == "bullish":
-            votes.append((+1, "MACD bullish crossover — momentum turning up"))
-        elif cross == "bearish":
-            votes.append((-1, "MACD bearish crossover — momentum turning down"))
-        elif cross == "none":
-            above = technicals.get("macd_above")
-            label = "above" if above else "below"
-            votes.append((0, f"MACD {label} signal line (no recent crossover)"))
+        # EMA-20 momentum
+        ema_20 = technicals.get("ema_20")
+        if ema_20 and price:
+            if price > ema_20:
+                votes.append((+1, f"Price ${price:.2f} above EMA-20 ${ema_20:.2f} — bullish momentum"))
+            else:
+                votes.append((-1, f"Price ${price:.2f} below EMA-20 ${ema_20:.2f} — bearish momentum"))
 
         # Price vs SMA-50
         sma_50 = technicals.get("sma_50")
@@ -344,14 +330,11 @@ def print_report(data, technicals, signal, total, votes):
         if rsi is not None:
             rsi_note = "  overbought ⚠" if rsi > 70 else ("  oversold ✓" if rsi < 30 else "  neutral")
             print(f"  RSI-14    {rsi:.1f}{rsi_note}")
-        cross = technicals.get("macd_cross")
-        if cross == "bullish":
-            print("  MACD      bullish crossover ✓")
-        elif cross == "bearish":
-            print("  MACD      bearish crossover ⚠")
-        elif cross == "none":
-            above = technicals.get("macd_above")
-            print(f"  MACD      {'above' if above else 'below'} signal line")
+        ema_20 = technicals.get("ema_20")
+        if ema_20 and price:
+            icon = "✓" if price > ema_20 else "⚠"
+            direction = "above" if price > ema_20 else "below"
+            print(f"  EMA-20    ${ema_20:.2f}  price {direction} {icon}")
         sma_50 = technicals.get("sma_50")
         if sma_50 and price:
             icon = "✓" if price > sma_50 else "⚠"
