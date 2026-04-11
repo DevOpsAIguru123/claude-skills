@@ -1,0 +1,24 @@
+{
+  "name": "claude-skills",
+  "owner": {
+    "name": "DevOpsAIguru123"
+  },
+  "metadata": {
+    "description": "Personal Claude Code skills collection — stock analysis and more",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "stock-analysis",
+      "source": "./stock-analysis",
+      "description": "Comprehensive stock analysis with Buy/Hold/Sell signal. Covers price, fundamentals (P/E, EPS, market cap), and optional technical indicators (RSI, MACD, SMA) via free Alpha Vantage key.",
+      "version": "1.0.0",
+      "author": {
+        "name": "DevOpsAIguru123"
+      },
+      "keywords": ["finance", "stocks", "trading", "investment", "technical-analysis", "fundamentals"],
+      "category": "research",
+      "license": "MIT"
+    }
+  ]
+}
