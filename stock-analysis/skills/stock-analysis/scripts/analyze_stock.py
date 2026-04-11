@@ -2,8 +2,8 @@
 """analyze_stock.py — Comprehensive stock analysis with Buy/Hold/Sell signal.
 
 Phases:
-  1. Quote & price   — Yahoo Finance v7 (no key)
-  2. Fundamentals    — Yahoo Finance v7 (no key)
+  1. Quote & price   — yfinance (auto-installed, wraps Yahoo Finance)
+  2. Fundamentals    — yfinance (P/E, EPS, market cap, analyst targets)
   3. Technicals      — Alpha Vantage RSI/MACD/SMA (optional free key)
   4. Signal          — Weighted vote → BUY / HOLD / SELL
 
@@ -18,14 +18,32 @@ import argparse
 import json
 import os
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.request
 
+
 # ---------------------------------------------------------------------------
-# SSL context — handles macOS Python installations where system certs aren't
-# linked. Tries certifi first, falls back to an unverified context for
-# read-only public financial data APIs.
+# yfinance — auto-install if missing
+# ---------------------------------------------------------------------------
+
+def _ensure_yfinance():
+    try:
+        import yfinance
+        return yfinance
+    except ImportError:
+        print("Installing yfinance…", file=sys.stderr)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "yfinance", "--quiet"],
+            stdout=subprocess.DEVNULL,
+        )
+        import yfinance
+        return yfinance
+
+
+# ---------------------------------------------------------------------------
+# SSL context for Alpha Vantage requests
 # ---------------------------------------------------------------------------
 
 def _ssl_context():
@@ -46,241 +64,87 @@ def _ssl_context():
 
 _SSL_CTX = _ssl_context()
 
-# Yahoo Finance requires a browser User-Agent + session cookies + a crumb token
-# (anti-scraping measure introduced in 2024). We use a single persistent opener
-# with a cookie jar so cookies flow automatically across all YF requests.
-_YF_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://finance.yahoo.com",
-    "Referer": "https://finance.yahoo.com/",
-}
 
-import http.cookiejar as _cookiejar
+# ---------------------------------------------------------------------------
+# Phase 1 + 2 — Quote & Fundamentals via yfinance
+# ---------------------------------------------------------------------------
 
-_yf_jar = _cookiejar.CookieJar()
-_yf_opener = urllib.request.build_opener(
-    urllib.request.HTTPSHandler(context=_SSL_CTX),
-    urllib.request.HTTPCookieProcessor(_yf_jar),
-)
-_yf_crumb = None  # cached after first call
-
-
-def _yf_init():
-    """Establish Yahoo Finance session (cookies + crumb). Called once per run."""
-    global _yf_crumb
-    if _yf_crumb is not None:
-        return
-
+def get_quote_and_fundamentals(symbol):
+    """Fetch price, volume, and fundamentals using yfinance."""
+    yf = _ensure_yfinance()
     try:
-        # Step 1: load Yahoo Finance home — this sets required session cookies
-        _yf_opener.open(
-            urllib.request.Request("https://finance.yahoo.com/", headers=_YF_HEADERS),
-            timeout=15,
-        )
-        # Step 2: exchange session cookies for a crumb token
-        with _yf_opener.open(
-            urllib.request.Request(
-                "https://query2.finance.yahoo.com/v1/test/getcrumb",
-                headers=_YF_HEADERS,
-            ),
-            timeout=15,
-        ) as resp:
-            _yf_crumb = resp.read().decode("utf-8").strip()
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
     except Exception as exc:
-        print(f"  [warn] Yahoo Finance session setup failed: {exc}", file=sys.stderr)
-        _yf_crumb = ""  # sentinel: don't retry
+        print(f"  [warn] yfinance error: {exc}", file=sys.stderr)
+        return None
+
+    if not info or not info.get("currentPrice") and not info.get("regularMarketPrice"):
+        return None
+
+    def _get(*keys):
+        for k in keys:
+            v = info.get(k)
+            if v is not None:
+                return v
+        return None
+
+    price = _get("currentPrice", "regularMarketPrice")
+    prev_close = _get("previousClose", "regularMarketPreviousClose")
+    change_pct = None
+    if price and prev_close and prev_close != 0:
+        change_pct = (price - prev_close) / prev_close * 100
+
+    return {
+        "symbol": info.get("symbol", symbol),
+        "name": _get("longName", "shortName") or symbol,
+        "price": price,
+        "prev_close": prev_close,
+        "change_pct": change_pct,
+        "day_high": _get("dayHigh", "regularMarketDayHigh"),
+        "day_low": _get("dayLow", "regularMarketDayLow"),
+        "w52_high": info.get("fiftyTwoWeekHigh"),
+        "w52_low": info.get("fiftyTwoWeekLow"),
+        "volume": _get("volume", "regularMarketVolume"),
+        "avg_volume": _get("averageVolume", "averageDailyVolume3Month"),
+        "market_cap": info.get("marketCap"),
+        "pe_trailing": info.get("trailingPE"),
+        "pe_forward": info.get("forwardPE"),
+        "eps": _get("trailingEps", "epsTrailingTwelveMonths"),
+        "analyst_target": _get("targetMeanPrice"),
+        "analyst_rating": _get("recommendationKey"),
+        "revenue_growth": info.get("revenueGrowth"),
+        "profit_margins": info.get("profitMargins"),
+        "dividend_yield": info.get("dividendYield"),
+        "currency": info.get("currency", "USD"),
+    }
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# Phase 3 — Technical Indicators (Alpha Vantage, optional free key)
 # ---------------------------------------------------------------------------
 
-def _fetch(url):
-    """Fetch a Yahoo Finance URL using the shared session opener."""
-    _yf_init()
-    if _yf_crumb and "crumb=" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}crumb={_yf_crumb}"
-    req = urllib.request.Request(url, headers=_YF_HEADERS)
-    try:
-        with _yf_opener.open(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        print(f"  [warn] HTTP {exc.code} for {url}", file=sys.stderr)
-        return None
-    except Exception as exc:
-        print(f"  [warn] {exc}", file=sys.stderr)
-        return None
+_AV_BASE = "https://www.alphavantage.co/query"
 
 
-def _fetch_plain(url):
-    """Fetch a non-Yahoo URL (e.g. Alpha Vantage) without session overhead."""
+def _av_fetch(url):
     req = urllib.request.Request(url)
     try:
         with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        print(f"  [warn] HTTP {exc.code} for {url}", file=sys.stderr)
+        print(f"  [warn] HTTP {exc.code} from Alpha Vantage", file=sys.stderr)
         return None
     except Exception as exc:
         print(f"  [warn] {exc}", file=sys.stderr)
         return None
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 + 2 — Quote & Fundamentals (Yahoo Finance, no key)
-# ---------------------------------------------------------------------------
-
-def get_quote_and_fundamentals(symbol):
-    """Fetch price, volume, fundamentals via Yahoo Finance.
-
-    Tries v7/quote first (rich fundamentals), falls back to v8/chart
-    (price + basic meta) if the first endpoint is rate-limited.
-    """
-    # Primary: v7/quote — returns fundamentals + price in one call
-    url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-    data = _fetch(url)
-
-    if data:
-        try:
-            result = data["quoteResponse"]["result"]
-            if result:
-                return _parse_v7_quote(result[0])
-        except (KeyError, IndexError):
-            pass
-
-    # Fallback: v8/chart — always-on endpoint with price + basic metadata
-    print("  [info] Falling back to chart endpoint…", file=sys.stderr)
-    chart_url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?interval=1d&range=1y&includePrePost=false"
-    )
-    chart_data = _fetch(chart_url)
-    if chart_data:
-        try:
-            meta = chart_data["chart"]["result"][0]["meta"]
-            return _parse_chart_meta(meta, symbol)
-        except (KeyError, IndexError, TypeError):
-            pass
-
-    return None
-
-
-def _parse_v7_quote(q):
-    """Extract fields from a v7/quote result object."""
-    def _get(key):
-        return q.get(key)
-
-    return {
-        "symbol": _get("symbol"),
-        "name": _get("longName") or _get("shortName"),
-        "price": _get("regularMarketPrice"),
-        "prev_close": _get("regularMarketPreviousClose"),
-        "change_pct": _get("regularMarketChangePercent"),
-        "day_high": _get("regularMarketDayHigh"),
-        "day_low": _get("regularMarketDayLow"),
-        "w52_high": _get("fiftyTwoWeekHigh"),
-        "w52_low": _get("fiftyTwoWeekLow"),
-        "volume": _get("regularMarketVolume"),
-        "avg_volume": _get("averageDailyVolume3Month"),
-        "market_cap": _get("marketCap"),
-        "pe_trailing": _get("trailingPE"),
-        "pe_forward": _get("forwardPE"),
-        "eps": _get("epsTrailingTwelveMonths"),
-        "analyst_target": _get("targetMeanPrice"),
-        "analyst_rating": _get("averageAnalystRating"),
-        "revenue_growth": _get("revenueGrowth"),
-        "dividend_yield": _get("dividendYield"),
-        "currency": _get("currency") or "USD",
-    }
-
-
-def _parse_chart_meta(meta, symbol):
-    """Extract available fields from v8/chart meta (price-focused, fewer fundamentals)."""
-    price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
-    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-    change_pct = None
-    if price and prev and prev != 0:
-        change_pct = (price - prev) / prev * 100
-
-    return {
-        "symbol": meta.get("symbol", symbol),
-        "name": meta.get("longName") or meta.get("shortName") or symbol,
-        "price": price,
-        "prev_close": prev,
-        "change_pct": change_pct,
-        "day_high": meta.get("regularMarketDayHigh"),
-        "day_low": meta.get("regularMarketDayLow"),
-        "w52_high": meta.get("fiftyTwoWeekHigh"),
-        "w52_low": meta.get("fiftyTwoWeekLow"),
-        "volume": meta.get("regularMarketVolume"),
-        "avg_volume": meta.get("averageDailyVolume3Month") or meta.get("averageDailyVolume10Day"),
-        "market_cap": meta.get("marketCap"),
-        "pe_trailing": meta.get("trailingPE"),
-        "pe_forward": None,
-        "eps": meta.get("epsTrailingTwelveMonths"),
-        "analyst_target": None,
-        "analyst_rating": None,
-        "revenue_growth": None,
-        "dividend_yield": None,
-        "currency": meta.get("currency") or "USD",
-    }
-
-    def _get(key):
-        return q.get(key)
-
-    price = _get("regularMarketPrice")
-    prev_close = _get("regularMarketPreviousClose")
-    change_pct = _get("regularMarketChangePercent")
-
-    return {
-        # Identity
-        "symbol": _get("symbol") or symbol,
-        "name": _get("longName") or _get("shortName") or symbol,
-        # Price
-        "price": price,
-        "prev_close": prev_close,
-        "change_pct": change_pct,
-        "day_high": _get("regularMarketDayHigh"),
-        "day_low": _get("regularMarketDayLow"),
-        "w52_high": _get("fiftyTwoWeekHigh"),
-        "w52_low": _get("fiftyTwoWeekLow"),
-        # Volume
-        "volume": _get("regularMarketVolume"),
-        "avg_volume": _get("averageDailyVolume3Month"),
-        # Fundamentals
-        "market_cap": _get("marketCap"),
-        "pe_trailing": _get("trailingPE"),
-        "pe_forward": _get("forwardPE"),
-        "eps": _get("epsTrailingTwelveMonths"),
-        "analyst_target": _get("targetMeanPrice"),
-        "analyst_rating": _get("averageAnalystRating"),
-        "revenue_growth": _get("revenueGrowth"),
-        "profit_margins": _get("profitMargins"),
-        "dividend_yield": _get("dividendYield"),
-        "currency": _get("currency") or "USD",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Phase 3 — Technical Indicators (Alpha Vantage, optional key)
-# ---------------------------------------------------------------------------
-
-_AV_BASE = "https://www.alphavantage.co/query"
 
 
 def get_technicals(symbol, av_key):
     """Fetch RSI-14, MACD, SMA-50 from Alpha Vantage."""
 
     def _av(function, extra):
-        url = f"{_AV_BASE}?function={function}&symbol={symbol}&apikey={av_key}&{extra}"
-        return _fetch_plain(url)
+        return _av_fetch(f"{_AV_BASE}?function={function}&symbol={symbol}&apikey={av_key}&{extra}")
 
     result = {}
 
@@ -290,9 +154,8 @@ def get_technicals(symbol, av_key):
         series = rsi_data["Technical Analysis: RSI"]
         latest = sorted(series.keys())[-1]
         result["rsi"] = float(series[latest]["RSI"])
-        result["rsi_date"] = latest
 
-    # MACD (default: fast=12, slow=26, signal=9)
+    # MACD
     macd_data = _av("MACD", "interval=daily&series_type=close")
     if macd_data and "Technical Analysis: MACD" in macd_data:
         series = macd_data["Technical Analysis: MACD"]
@@ -300,14 +163,10 @@ def get_technicals(symbol, av_key):
         if len(dates) >= 2:
             cur = series[dates[-1]]
             prv = series[dates[-2]]
-            macd_cur = float(cur["MACD"])
-            sig_cur = float(cur["MACD_Signal"])
-            macd_prv = float(prv["MACD"])
-            sig_prv = float(prv["MACD_Signal"])
-
+            macd_cur, sig_cur = float(cur["MACD"]), float(cur["MACD_Signal"])
+            macd_prv, sig_prv = float(prv["MACD"]), float(prv["MACD_Signal"])
             result["macd"] = macd_cur
             result["macd_signal_line"] = sig_cur
-
             if macd_prv < sig_prv and macd_cur >= sig_cur:
                 result["macd_cross"] = "bullish"
             elif macd_prv > sig_prv and macd_cur <= sig_cur:
@@ -331,9 +190,8 @@ def get_technicals(symbol, av_key):
 # ---------------------------------------------------------------------------
 
 def score(data, technicals):
-    """Each metric votes -1/0/+1. Signal = BUY (≥+2), HOLD (-1..+1), SELL (≤-2)."""
-    votes = []  # list of (int, str)
-
+    """Each metric votes -1/0/+1. Signal: BUY (≥+2), HOLD (-1..+1), SELL (≤-2)."""
+    votes = []
     price = data.get("price")
 
     # P/E ratio
@@ -376,10 +234,8 @@ def score(data, technicals):
             votes.append((-1, "MACD bearish crossover — momentum turning down"))
         elif cross == "none":
             above = technicals.get("macd_above")
-            if above is True:
-                votes.append((0, "MACD above signal line (no recent crossover)"))
-            elif above is False:
-                votes.append((0, "MACD below signal line (no recent crossover)"))
+            label = "above" if above else "below"
+            votes.append((0, f"MACD {label} signal line (no recent crossover)"))
 
         # Price vs SMA-50
         sma_50 = technicals.get("sma_50")
@@ -390,13 +246,7 @@ def score(data, technicals):
                 votes.append((-1, f"Price ${price:.2f} below SMA-50 ${sma_50:.2f}"))
 
     total = sum(v for v, _ in votes)
-    if total >= 2:
-        signal = "BUY"
-    elif total <= -2:
-        signal = "SELL"
-    else:
-        signal = "HOLD"
-
+    signal = "BUY" if total >= 2 else "SELL" if total <= -2 else "HOLD"
     return signal, total, votes
 
 
@@ -425,7 +275,7 @@ def _fmt_vol(n):
         return f"{n/1e6:.1f}M"
     if n >= 1e3:
         return f"{n/1e3:.1f}K"
-    return str(n)
+    return str(int(n))
 
 
 def _fmt_pct(n):
@@ -439,46 +289,36 @@ def _fmt_pct(n):
 def print_report(data, technicals, signal, total, votes):
     W = 52
     line = "─" * W
-
     symbol = data.get("symbol", "?")
     name = data.get("name", symbol)
+
     print(f"\n{symbol} — {name}")
     print(line)
 
-    # Price block
     price = data.get("price")
     chg = data.get("change_pct")
     chg_str = f"  ({chg:+.2f}% today)" if chg is not None else ""
     print(f"PRICE     ${price:.2f}{chg_str}" if price else "PRICE     N/A")
 
-    w52h = data.get("w52_high")
-    w52l = data.get("w52_low")
-    if w52l and w52h:
-        # Show where current price sits in the 52w range
-        if price:
-            pct_range = (price - w52l) / (w52h - w52l) * 100
-            bar_len = 20
-            filled = int(pct_range / 100 * bar_len)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            print(f"52W       ${w52l:.2f} [{bar}] ${w52h:.2f}")
-        else:
-            print(f"52W       ${w52l:.2f} – ${w52h:.2f}")
+    w52h, w52l = data.get("w52_high"), data.get("w52_low")
+    if w52l and w52h and price:
+        pct = (price - w52l) / (w52h - w52l) * 100
+        filled = int(pct / 100 * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        print(f"52W       ${w52l:.2f} [{bar}] ${w52h:.2f}")
 
-    vol = data.get("volume")
-    avg_vol = data.get("avg_volume")
+    vol, avg_vol = data.get("volume"), data.get("avg_volume")
     if vol:
         avg_str = f"  (avg {_fmt_vol(avg_vol)})" if avg_vol else ""
         print(f"Volume    {_fmt_vol(vol)}{avg_str}")
 
-    # Fundamentals block
     print(f"\nFUNDAMENTALS")
     print(f"  Market Cap     {_fmt_cap(data.get('market_cap'))}")
 
     pe = data.get("pe_trailing") or data.get("pe_forward")
-    pe_label = "(fwd)" if data.get("pe_trailing") is None and data.get("pe_forward") else ""
     if pe and pe > 0:
         pe_note = "  ⚠ elevated" if pe > 35 else ("  ✓ low" if pe < 15 else "")
-        print(f"  P/E Ratio      {pe:.1f} {pe_label}{pe_note}")
+        print(f"  P/E Ratio      {pe:.1f}{pe_note}")
     else:
         print(f"  P/E Ratio      N/A")
 
@@ -489,40 +329,29 @@ def print_report(data, technicals, signal, total, votes):
     if target and price:
         upside = (target - price) / price * 100
         print(f"  Analyst Target ${target:.2f}  ({upside:+.1f}% upside)")
-    elif target:
-        print(f"  Analyst Target ${target:.2f}")
 
     rating = data.get("analyst_rating")
     if rating:
-        print(f"  Analyst Rating {rating}")
+        print(f"  Analyst Rating {rating.upper()}")
 
     dy = data.get("dividend_yield")
     if dy:
         print(f"  Dividend Yield {_fmt_pct(dy)}")
 
-    # Technicals block
     if technicals:
         print(f"\nTECHNICALS  (Alpha Vantage)")
         rsi = technicals.get("rsi")
         if rsi is not None:
-            if rsi > 70:
-                rsi_note = "  overbought ⚠"
-            elif rsi < 30:
-                rsi_note = "  oversold ✓"
-            else:
-                rsi_note = "  neutral"
+            rsi_note = "  overbought ⚠" if rsi > 70 else ("  oversold ✓" if rsi < 30 else "  neutral")
             print(f"  RSI-14    {rsi:.1f}{rsi_note}")
-
         cross = technicals.get("macd_cross")
         if cross == "bullish":
-            print(f"  MACD      bullish crossover ✓")
+            print("  MACD      bullish crossover ✓")
         elif cross == "bearish":
-            print(f"  MACD      bearish crossover ⚠")
+            print("  MACD      bearish crossover ⚠")
         elif cross == "none":
             above = technicals.get("macd_above")
-            state = "above" if above else "below"
-            print(f"  MACD      {state} signal line  (no crossover)")
-
+            print(f"  MACD      {'above' if above else 'below'} signal line")
         sma_50 = technicals.get("sma_50")
         if sma_50 and price:
             icon = "✓" if price > sma_50 else "⚠"
@@ -531,17 +360,15 @@ def print_report(data, technicals, signal, total, votes):
     else:
         print(f"\nTECHNICALS  not available — pass --av-key for RSI, MACD, SMA")
 
-    # Signal votes
     print(f"\nSIGNAL VOTES")
     for vote, reason in votes:
         marker = f"{vote:+d}" if vote != 0 else " 0"
         print(f"  {marker}  {reason}")
     print(f"  {'─'*40}")
 
-    signal_labels = {"BUY": "▲ BUY", "HOLD": "◆ HOLD", "SELL": "▼ SELL"}
-    print(f"  {total:+d}  →  {signal_labels[signal]}")
+    labels = {"BUY": "▲ BUY", "HOLD": "◆ HOLD", "SELL": "▼ SELL"}
+    print(f"  {total:+d}  →  {labels[signal]}")
 
-    # One-line reasoning
     bull = [r for v, r in votes if v > 0]
     bear = [r for v, r in votes if v < 0]
     if signal == "BUY":
@@ -557,7 +384,6 @@ def print_report(data, technicals, signal, total, votes):
             print(f"\n  Mixed signals: {bull[0]} offset by {bear[0]}.")
         else:
             print(f"\n  No strong directional signal.")
-
     print()
 
 
@@ -603,18 +429,11 @@ def main():
     sig, total, votes = score(data, technicals)
 
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "data": data,
-                    "technicals": technicals,
-                    "signal": sig,
-                    "score": total,
-                    "votes": [[v, r] for v, r in votes],
-                },
-                indent=2,
-            )
-        )
+        print(json.dumps({
+            "data": data, "technicals": technicals,
+            "signal": sig, "score": total,
+            "votes": [[v, r] for v, r in votes],
+        }, indent=2))
         return
 
     print_report(data, technicals, sig, total, votes)
